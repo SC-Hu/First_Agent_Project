@@ -1,7 +1,8 @@
 import json
-import traceback # 用于打印详细错误栈
+import traceback
+from langfuse import observe # 新增 - 链路追踪装饰器
 from config import client, Config, logger
-from prompts import SYSTEM_PROMPT
+from prompts import SYSTEM_PROMPT, REFLECTION_PROMPT
 from tools import TOOL_MAP, TOOLS_SCHEMA
 from database import db
 from utils import count_tokens, generate_title, generate_fact_sheet
@@ -124,7 +125,28 @@ class ReActAgent:
                 self.messages = self._load_context()
                 self.current_total_tokens = count_tokens(self.messages)
 
-    def run(self, user_query: str, max_turns: int = 5):
+    @observe(as_type="generation") # 追踪反思过程
+    def _run_reflection(self, user_query: str, draft_answer: str) -> tuple[bool, str]:
+        """自我反思机制：使用 JSON Mode 确保返回格式"""
+        prompt = f"【用户原始问题】: {user_query}\n\n【Agent草稿回答】: {draft_answer}"
+        try:
+            resp = client.chat.completions.create(
+                model=Config.MODEL, # 此处工业界常替换为稍便宜但逻辑好的模型以省钱
+                messages=[
+                    {"role": "system", "content": REFLECTION_PROMPT},
+                    {"role": "user", "content": prompt}
+                ],
+                response_format={"type": "json_object"}, # 强约束输出 JSON
+                temperature=0.1
+            )
+            result = json.loads(resp.choices[0].message.content)
+            return result.get("pass", False), result.get("feedback", "解析失败")
+        except Exception as e:
+            logger.error(f"反思模块异常: {e}")
+            return True, "反思模块异常，默认放行"
+    
+    @observe() # 新增 - 自动追踪整个 run 函数的执行链路
+    def run(self, user_query: str, max_turns: int = 10): # 增加轮数以支持反思循环
         """流式生成器：通过 yield 逐步返回生成的文字和状态"""
 
         # 处理用户输入
@@ -151,17 +173,18 @@ class ReActAgent:
                     messages=self.messages,
                     tools=TOOLS_SCHEMA if TOOLS_SCHEMA else None,
                     tool_choice="auto",
-                    temperature=0.2, # 流式推理时略微加一点温度让思维更流畅
+                    temperature=0.3, # 促进思考
                     stream=True,
                     stream_options={"include_usage": True} # 让最后一个 chunk 返回精确的 Token 消耗
                 )
             except Exception as e:
                 yield f"\n[系统错误] API 调用失败: {e}"
                 return
-            
+
             # --- 用于拼接流式碎片的容器 ---
             content_buffer = ""
             tool_calls_dict = {}  # 结构：{index: {"id":..., "function": {"name":..., "arguments":...}}}
+            content_started = False # 终端UI渲染开关
 
             for chunk in response:
                 # 处理最后一个包含 usage 的纯数据 chunk
@@ -171,13 +194,20 @@ class ReActAgent:
 
                 delta = chunk.choices[0].delta
 
-                # 1. 如果是文本流（模型的思考或回答）
+                # 遇到文本，打印思维链（CoT）
                 if delta.content:
+                    if not content_started:
+                        yield "\n\033[90m[🧠 思考流] " # 使用 ANSI 灰色打印思考过程
+                        content_started = True
                     content_buffer += delta.content
                     yield delta.content  # 实时吐出给前端界面
 
-                # 2. 如果是工具调用流（需要碎片拼接）
+                # 遇到工具调用
                 if delta.tool_calls:
+                    if content_started:
+                        yield "\033[0m" # 恢复默认终端颜色
+                        content_started = False
+
                     for tc in delta.tool_calls:
                         idx = tc.index
                         if idx not in tool_calls_dict:
@@ -191,7 +221,11 @@ class ReActAgent:
                                 tool_calls_dict[idx]["function"]["name"] += tc.function.name
                             if tc.function.arguments:
                                 tool_calls_dict[idx]["function"]["arguments"] += tc.function.arguments
-            # --- 流读取完毕，整理本轮回合数据 ---
+            
+            # 恢复颜色，如果只输出了文本，没有调工具，也要保证在最后把颜色恢复正常，不影响用户后续的打字
+            if content_started: yield "\033[0m"
+
+            # 流读取完毕，整理本轮回合数据
             tool_calls_list = list(tool_calls_dict.values()) if tool_calls_dict else None
 
             # 保存到历史记录中
@@ -201,41 +235,72 @@ class ReActAgent:
                 tool_calls=tool_calls_list
             )
 
-            # 如果没有触发工具调用，说明大模型给出了最终回答，跳出循环
-            if not tool_calls_list:
-                self._check_and_summarize()
-                return
+            # 异常情况：模型既没思考也没调用工具
+            if not tool_calls_list and not content_buffer:
+                yield "\n[系统] 模型返回为空，结束思考。"
+                break
             
             # 如果触发了工具调用，开始执行
-            for tc in tool_calls_list:
-                func_name = tc["function"]["name"]
-                raw_args = tc["function"]["arguments"]
-                func_args = self._safe_json_parse(raw_args)
-                tool_call_id = tc["id"] # 每个调用都有唯一 ID
-
-                # 提示用户正在使用什么工具
-                yield f"\n\n[⚙️ 正在调用工具: {func_name} ...]\n"
+            if tool_calls_list:
+                for tc in tool_calls_list:
+                    func_name = tc["function"]["name"]
+                    raw_args = tc["function"]["arguments"]
+                    func_args = self._safe_json_parse(raw_args)
+                    tool_call_id = tc["id"] # 每个调用都有唯一 ID
                     
-                if func_args is None:
-                    obs = "错误：工具参数 JSON 格式非法。"
-                # 工具执行逻辑
-                elif func_name not in TOOL_MAP:
-                    obs = f"错误：工具 {func_name} 不存在。"
-                else:                        
-                    logger.info(f"执行工具: {func_name} | 参数: {func_args}")
-                    try:
-                        obs = TOOL_MAP[func_name](**func_args)
-                    except Exception as e:
-                        # 将错误回传给模型，让它尝试修复
-                        obs = f"工具执行出错: {str(e)}"
-                        logger.error(f"工具 {func_name} 崩溃: {traceback.format_exc()}")
+
+                    # --- 认知核心：反思拦截 ---
+                    if func_name == "submit_final_answer":
+                        draft_answer = func_args.get("answer", "未提取到答案。")
+                        yield f"\n\n[🕵️ 系统审核拦截 (Self-Reflection)...]\n"
+                        
+                        # 触发大模型自身去审视草稿
+                        is_pass, feedback = self._run_reflection(user_query, draft_answer)
+                        
+                        if is_pass:
+                            yield f"✅ 审核通过！\n\n🎯 最终回答:\n{draft_answer}"
+                            self._save_and_append("tool", content="审核通过。任务结束。", tool_call_id=tool_call_id)
+                            self._check_and_summarize()
+                            return # 真正结束并退出
+                        else:
+                            yield f"❌ 审核被驳回：{feedback}\n[🔄 触发自愈纠错机制 (Self-Correction)...]\n"
+                            obs = f"你的回答被系统 Reviewer 驳回！必须修正，驳回理由：\n{feedback}"
+                            self._save_and_append("tool", content=obs, tool_call_id=tool_call_id)
+                            continue # 直接进入下一轮重试
+                    
+                    
+
+                    # --- 常规工具执行与自愈增强 ---
+                    yield f"\n\n[⚙️ 正在调用工具: {func_name} ...]\n"
+                    
+                    if func_args is None:
+                        obs = f"错误：工具参数 JSON 格式非法: {raw_args}。请修正你的输出格式。"
+                    # 工具执行逻辑
+                    elif func_name not in TOOL_MAP:
+                        obs = f"错误：工具 {func_name} 不存在。"
+                    else:                        
+                        logger.info(f"执行工具: {func_name} | 参数: {func_args}")
+                        try:
+                            obs = TOOL_MAP[func_name](**func_args)
+                        except Exception as e:
+                            # 错误自愈增强 - 将详细的 traceback 喂给大模型，让它知道代码错在哪
+                            error_detail = traceback.format_exc()
+                            obs = f"工具执行发生严重异常:\n{error_detail}\n请仔细检查参数逻辑，修正后重新尝试！"
+                            logger.error(f"工具 {func_name} 崩溃: {error_detail}")
                                             
-                # 把结果喂回给大模型上下文
-                # 必须包含 tool_call_id，角色必须是 "tool"
-                self._save_and_append("tool", content=str(obs), tool_call_id=tool_call_id)
+                    # 把结果喂回给大模型上下文
+                    # 必须包含 tool_call_id，角色必须是 "tool"
+                    self._save_and_append("tool", content=str(obs), tool_call_id=tool_call_id)
                 
-            # 工具执行完毕，不要退出，直接 continue 进入下一轮让大模型总结
-            continue
+                # 执行完工具后，由于 continue，会自动进入下一个 turn 让大模型基于 observation 继续思考
+                continue
+            
+            else:
+                # 防御机制：如果模型忘记调用 submit_final_answer 直接输出了文本
+                yield f"\n[⚠️ 警告：检测到违规输出。已强制要求模型使用标准工具提交答案。]"
+                self._save_and_append("user", content="系统提示：绝不要直接在文本中回答用户！请将你的结论通过调用 `submit_final_answer` 工具进行提交。")
+                continue
+
 
         yield "\n\n[系统] 思考达到最大上限，未能完全解决问题。"
         self._check_and_summarize()
